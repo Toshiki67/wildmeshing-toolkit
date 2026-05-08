@@ -2,10 +2,20 @@
 include(wmtk_data)
 include(jse)
 
+option(WMTK_APP_REMESH "Eigen edge-collapse remesh application" ON)
+if(WMTK_APP_REMESH)
+    add_subdirectory(remesh)
+endif()
+
+option(WMTK_APP_HIERARCHY "Hierarchy application" ON)
 option(WMTK_APP_HARMTET "Harmonic Triangulation app" ON)
 option(WMTK_APP_INTERIOR_TET_OPT "interior tet opt application" ON)
 
 option(WMTK_APP_UNIT_TESTS "unit tests for applications" ON)
+
+# if(WMTK_APP_HIERARCHY)
+#     add_subdirectory(hieararchy)
+# endif()
 
 if(WMTK_APP_INTERIOR_TET_OPT)
 add_subdirectory(interior_tet_opt)

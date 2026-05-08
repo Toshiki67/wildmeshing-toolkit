@@ -84,7 +84,21 @@ include(nanoflann)
 include(polysolve)
 include(ipc_toolkit)
 
+include(polyscope)
+
 include(simple_bvh)
+
+
+set(AUTODIFF_BUILD_TESTS OFF)
+set(AUTODIFF_BUILD_PYTHON OFF)
+set(AUTODIFF_BUILD_EXAMPLES OFF)
+set(AUTODIFF_BUILD_DOCS OFF)
+set(AUTODIFF_BUILD_TESTS OFF CACHE BOOL "Disable testing for dependencies" FORCE)
+set(AUTODIFF_BUILD_PYTHON OFF CACHE BOOL "Disable Eigen testing" FORCE)
+set(AUTODIFF_BUILD_EXAMPLES OFF CACHE BOOL "Disable Eigen unsupported testing" FORCE)
+set(AUTODIFF_BUILD_DOCS OFF CACHE BOOL "Disable Eigen unsupported testing" FORCE)
+
+find_package(autodiff REQUIRED)
 # Sort projects inside the solution
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
@@ -143,6 +157,8 @@ target_link_libraries(wildmeshing_toolkit PUBLIC
     simple_bvh::simple_bvh
     polysolve::polysolve
     ipc::toolkit
+    polyscope
+    autodiff::autodiff
 )
 
 if(MSVC)
