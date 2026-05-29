@@ -7,12 +7,19 @@
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
 
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace app::remesh {
+
+// Forward declarations for Woodbury / CHOLMOD precomputed state.
+// Definitions live in the .cpp so <cholmod.h> stays out of the public header.
+struct WoodburyBase;
+struct KrrPrecomp;
+struct KnewPrecomp;
 
 struct VertexAttributes {
     Eigen::Vector2d pos;
@@ -38,7 +45,7 @@ struct CollapseParams {
     int    weight_mode   = 0;
     // Kinetic shift: K_eff = K + alpha*M.  Applied when fixed_left=false to
     // regularize the otherwise singular free-free stiffness matrix.
-    double alpha         = 1.0;
+    double alpha         = 0.0;
     // Spring boundary conditions: add spring_k to K's diagonal at every DOF
     // on the left (x ≈ x_min) and right (x ≈ x_max) boundary.
     // When > 0, overrides fixed_left and alpha (all DOFs stay in the system;
@@ -58,6 +65,13 @@ struct CollapseParams {
     // Overrides material_obj when true.
     bool is_gradient = false;
 
+    // Optional: file containing fine-mesh vertex indices (whitespace-separated)
+    // to attach springs to. When set, replaces the default left+right boundary
+    // spring placement. Spring stiffness is given by spring_k. The contribution
+    // to the coarse stiffness matrix is P^T K_spring^fine P, where P is the
+    // barycentric prolongation (fine ← coarse).
+    std::string spring_fine_verts_file;
+
     double get_nu_left()  const { return nu_left  >= 0.0 ? nu_left  : nu; }
     double get_nu_right() const { return nu_right >= 0.0 ? nu_right : nu; }
 };
@@ -68,7 +82,8 @@ public:
 
     // ------------------------------------------------------------------ init
 
-    EigenEdgeCollapse() { p_vertex_attrs = &vertex_attrs; }
+    EigenEdgeCollapse();
+    ~EigenEdgeCollapse(); // defined in .cpp so unique_ptr<WoodburyBase> can be destroyed
 
     // Load OBJ, assemble fine FEM, compute eigenmodes, init TriMesh topology.
     void init_from_obj(const std::string& path, const CollapseParams& p);
@@ -105,6 +120,19 @@ public:
         const Eigen::MatrixXd& V,
         const Eigen::MatrixXi& F) const;
 
+    // Save fine mesh colored by E with m_spring_fine_verts overlaid as red dots.
+    // Useful for verifying where user-specified spring constraints are located.
+    // No-op if m_spring_fine_verts is empty.
+    void save_springs_svg(const std::string& path) const;
+
+    // Programmatically set the fine vertex IDs that have spring constraints.
+    // When non-empty, takes precedence over CollapseParams::spring_fine_verts_file
+    // in subsequent init_from_obj() calls.
+    void set_spring_fine_verts(const std::vector<int>& verts) {
+        m_spring_fine_verts = verts;
+    }
+    const std::vector<int>& spring_fine_verts() const { return m_spring_fine_verts; }
+
     // Expose fine mesh for external inspection
     const Eigen::MatrixXd& V_fine() const { return m_V_fine; }
     const Eigen::MatrixXi& F_fine() const { return m_F_fine; }
@@ -140,8 +168,28 @@ private:
     std::vector<int> m_modes;  // mode indices used in cost
     std::vector<int> m_free_fine; // free DOF indices on fine mesh
 
+    // Sparse K_fine restricted to free fine DOFs (with kinetic shift / spring BCs
+    // already applied — matches the operator used in the eigenproblem) and its
+    // LDLT factor.  Built once in init_from_obj and reused by candidate_cost
+    // for the K_f^{-1} norm term.
+    Eigen::SparseMatrix<double> m_K_fine_ff;
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> m_K_fine_ff_solver;
+
     CollapseParams m_p;
     std::string    m_output_dir; // set via set_output_dir(); "" = disabled
+
+    // Fine-mesh vertex IDs to attach springs to (loaded from p.spring_fine_verts_file).
+    // Empty → fall back to left/right boundary detection inside apply_spring_bcs.
+    std::vector<int> m_spring_fine_verts;
+
+    // ---------------------------- Woodbury / CHOLMOD precomputed base state
+    // Holds K_base (full coarse K with BCs applied) + its CHOLMOD factor, plus
+    // the V/F snapshot they were built from. Rebuilt every simplify step.
+    std::unique_ptr<WoodburyBase> m_wb_base;
+
+    // (Re)build m_wb_base from the current TriMesh state (V_curr, F_curr).
+    // Called once per simplify step.
+    void rebuild_woodbury_base();
 
     // ------------------------------------------------ per-collapse cache
 
@@ -192,10 +240,19 @@ private:
     std::vector<int> left_boundary_verts(const Eigen::MatrixXd& V) const;
     std::vector<int> right_boundary_verts(const Eigen::MatrixXd& V) const;
 
-    // Add spring_k to K's diagonal at all DOFs of left and right boundaries.
+    // Add spring contribution to K.
+    //   * If m_spring_fine_verts is non-empty: for each listed fine vertex v_f,
+    //     locate the coarse triangle (V_coarse, F_coarse) containing it with
+    //     barycentric weights (w0, w1, w2) at coarse vertices (c0, c1, c2), and
+    //     add spring_k * w_i * w_j to K(2*c_i+comp, 2*c_j+comp) for comp ∈ {x,y}.
+    //     This is exactly P^T K_spring^fine P, the projection of fine springs
+    //     onto the coarse DOFs via the barycentric prolongation P.
+    //   * Otherwise: fall back to legacy behavior — add spring_k to the diagonal
+    //     of K at all DOFs on the left and right boundary of V_coarse.
     // No-op when m_p.spring_k == 0.
     void apply_spring_bcs(Eigen::SparseMatrix<double>& K,
-                          const Eigen::MatrixXd& V) const;
+                          const Eigen::MatrixXd& V_coarse,
+                          const Eigen::MatrixXi& F_coarse) const;
 
     // All DOF indices (0-indexed) in the complement of fixed_verts
     std::vector<int> free_dof_indices(int ndof, const std::vector<int>& fixed_verts) const;
@@ -255,6 +312,43 @@ private:
     double candidate_cost(
         const Eigen::MatrixXd& V_cand,
         const Eigen::MatrixXi& F_cand) const;
+
+    // Woodbury-based variant of candidate_cost (Apple Accelerate version).
+    // Reuses the precomputed Apple Cholesky factor of K_base (m_wb_base) and
+    // applies:
+    //   1) a block-deletion correction for vj's DOFs (2 Apple solves)
+    //   2) a Woodbury rank-s update on the 1-star of the merged vertex
+    //      (s Apple solves + dense s×s inverse via Eigen)
+    // plus spring contribution delta accumulation if applicable.
+    //
+    // vi_curr, vj_curr are the two endpoints' compact indices in m_wb_base->V.
+    // V_cand / F_cand must be the result of collapse_edge_static(V_curr, F_curr, vi, vj).
+    // Returns infinity if the Woodbury invariants don't hold (e.g. the V_cand
+    // free-DOF set differs from V_curr's minus vj's DOFs because vi changed
+    // boundary status), so callers can fall back to candidate_cost.
+    double candidate_cost_woodbury_accelerated(
+        const Eigen::MatrixXd& V_cand,
+        const Eigen::MatrixXi& F_cand,
+        int vi_curr, int vj_curr) const;
+
+    // Lightweight approximate cost for edge (vi, vj) collapse.
+    //   1) Build the local post-collapse 1-ring mesh (V_curr indexing, vi at
+    //      cpos, vj merged into vi, degenerate tris dropped).
+    //   2) Compute barycentric expansion of the OLD positions V_curr[vi] and
+    //      V_curr[vj] inside this local mesh, decomposing the merged vertex's
+    //      weight into V_curr[vi] / V_curr[vj] via ratio r along (vi, vj).
+    //      bary_vi / bary_vj are lists of (V_curr index, weight) pairs.
+    //   3) Use bary_vi / bary_vj to construct a constraint vector C and solve
+    //      x = K_bc^{-1} C, then return x^T M x (or similar).
+    // The C construction (step 3) is left in a simple placeholder form;
+    // callers can refine it using the bary expansions.
+    double cost_approx(
+        int vi, int vj,
+        int vi_wmtk, int vj_wmtk,
+        const Eigen::MatrixXd& V_curr,
+        const Eigen::MatrixXi& F_curr,
+        const std::vector<std::vector<int>>& v_faces,
+        const BoundaryInfo& binfo_curr) const;
 
     // -------------------------------------------------- mesh extraction
 
