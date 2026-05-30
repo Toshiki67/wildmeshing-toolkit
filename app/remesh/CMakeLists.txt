@@ -1,11 +1,14 @@
 file(GLOB_RECURSE LIB_SOURCES CONFIGURE_DEPENDS
     "src/EigenEdgeCollapse.cpp"
     "src/EigenEdgeCollapse.hpp"
+    "src/EigenEdgeCollapseInternal.hpp"
+    "src/FemAssembly.cpp"
+    "src/CostFunctions.cpp"
+    "src/Visualization.cpp"
     "src/VisUtils.cpp"
     "src/VisUtils.hpp"
     # stb_image_write impl is provided transitively by polyscope's bundled
     # stb library (linked via wmtk::toolkit → polyscope → stb).
-    # "src/stb_impl.cpp"
 )
 
 add_library(remesh_lib ${LIB_SOURCES})
