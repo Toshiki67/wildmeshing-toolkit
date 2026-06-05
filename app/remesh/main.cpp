@@ -245,7 +245,24 @@ int main(int argc, char** argv)
     }
 
     // ── simplification ────────────────────────────────────────────────
-    int collapses = mesh.simplify(target);
+    // Intermediate simulation bundles at coarse-vertex counts 4·target,
+    // 16·target, 64·target, … below the initial fine vertex count.
+    {
+        const std::string sim_dir = output_dir.empty()
+            ? fs::path(output).parent_path().string()
+            : output_dir;
+        const std::string base = fs::path(output).stem().string();
+        const std::string prefix =
+            (fs::path(sim_dir.empty() ? "." : sim_dir) / (base + "_inter_sim")).string();
+        mesh.set_intermediate_bundle(prefix, 4 * target);
+
+        // Cascadic-MG prolongation triplets (1 file per adjacent level pair).
+        const std::string cascade_prefix =
+            (fs::path(sim_dir.empty() ? "." : sim_dir) / (base + "_cascade")).string();
+        mesh.set_cascade_output(cascade_prefix);
+    }
+    // int collapses = mesh.simplify(target);
+    int collapses = mesh.simplify_factor_reuse(target);
     // int collapses = mesh.simplify_incremental(target);
     mesh.consolidate_mesh();
     mesh.write_obj(output);
@@ -261,5 +278,74 @@ int main(int argc, char** argv)
     std::cout << "Finished: " << n_init << " -> "
               << mesh.get_vertices().size() << " vertices ("
               << collapses << " collapses)\n";
+
+    // ── Simulation bundles for both meshes ────────────────────────────────
+    // Each bundle is a self-contained snapshot of the FEM problem instance:
+    //   mesh + per-face (E, ν) + fixed DOFs + spring contribution + scalars.
+    // Loadable from any external simulation code (numpy, libigl, etc.).
+    {
+        const std::string sim_dir = output_dir.empty()
+            ? fs::path(output).parent_path().string()
+            : output_dir;
+        const std::string base = fs::path(output).stem().string();
+        const std::string fine_prefix =
+            (fs::path(sim_dir.empty() ? "." : sim_dir) / (base + "_fine_sim")).string();
+        const std::string simp_prefix =
+            (fs::path(sim_dir.empty() ? "." : sim_dir) / (base + "_simp_sim")).string();
+
+        mesh.save_simulation_bundle(
+            fine_prefix, mesh.V_fine(), mesh.F_fine(),
+            mesh.fine_E(), mesh.fine_nu());
+
+        Eigen::MatrixXd V_simp;
+        Eigen::MatrixXi F_simp;
+        Eigen::VectorXd E_simp, nu_simp;
+        mesh.get_current_mesh_with_material(V_simp, F_simp, E_simp, nu_simp);
+        mesh.save_simulation_bundle(simp_prefix, V_simp, F_simp, E_simp, nu_simp);
+    }
+
+    // ── Final Polyscope view: original fine mesh + simplified mesh ────────
+    // Both registered at z = 0 in the same coordinate frame.  Polyscope's UI
+    // panel on the left lets the user toggle each structure on/off and tweak
+    // the "Young's modulus E" face quantity (color map, range, etc.).
+    {
+        polyscope::state::userCallback = nullptr;
+        polyscope::removeAllStructures();
+
+        // Fine mesh + per-face E.
+        const Eigen::MatrixXd& V_fine = mesh.V_fine();
+        const Eigen::MatrixXi& F_fine = mesh.F_fine();
+        const Eigen::VectorXd& E_fine = mesh.fine_E();
+        Eigen::MatrixXd V_fine_3d(V_fine.rows(), 3);
+        V_fine_3d.leftCols(2) = V_fine;
+        V_fine_3d.col(2).setZero();
+
+        auto* psFine = polyscope::registerSurfaceMesh(
+            "Original fine mesh", V_fine_3d, F_fine);
+        psFine->addFaceScalarQuantity("Young's modulus E", E_fine)
+              ->setColorMap("turbo")
+              ->setEnabled(true);
+
+        // Simplified mesh + per-face E (area-weighted average from fine mesh).
+        Eigen::MatrixXd V_simp;
+        Eigen::MatrixXi F_simp;
+        Eigen::VectorXd E_simp;
+        mesh.get_current_mesh_with_E(V_simp, F_simp, E_simp);
+        Eigen::MatrixXd V_simp_3d(V_simp.rows(), 3);
+        V_simp_3d.leftCols(2) = V_simp;
+        V_simp_3d.col(2).setZero();
+
+        auto* psSimp = polyscope::registerSurfaceMesh(
+            "Simplified mesh", V_simp_3d, F_simp);
+        psSimp->addFaceScalarQuantity("Young's modulus E", E_simp)
+              ->setColorMap("turbo")
+              ->setEnabled(true);
+        // Start with the simplified mesh hidden so the fine-mesh material
+        // distribution is visible by default; the user can toggle from the UI.
+        psSimp->setEnabled(false);
+
+        polyscope::show();
+    }
+
     return 0;
 }

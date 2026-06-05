@@ -733,63 +733,117 @@ Eigen::Vector2d EigenEdgeCollapse::enclosure_pos(
         return cnt;
     };
 
-    // Start from the candidate with the most initial coverage.
-    Eigen::Vector2d p = mid;
-    {
-        int best_cov = coverage_count(mid);
-        for (const Eigen::Vector2d& cand : {vi_pos, vj_pos}) {
-            int c = coverage_count(cand);
-            if (c > best_cov) { best_cov = c; p = cand; }
+    // ── Initial candidate set ──────────────────────────────────────────────
+    // The original set {mid, vi_pos, vj_pos} all sit on the chord vi–vj. When
+    // the boundary curves outward (convex), neither endpoint can be enclosed
+    // from a chord-resident cpos: vi falls outside any post-tri whose chord is
+    // (cpos, vk_right), and likewise for vj.  OR-POCS then oscillates between
+    // the two endpoints and converges to 3/4 coverage.
+    //
+    // We extend the candidate set with chord-perpendicular OUTWARD offsets so
+    // that the search can escape the chord into the region outside the mesh,
+    // where post-tris widen and can wrap both endpoints simultaneously.
+    Eigen::Vector2d outward(0, 0);
+    const Eigen::Vector2d chord = vj_pos - vi_pos;
+    const double chord_len = chord.norm();
+    if (chord_len > 1e-12 && adj_face >= 0) {
+        // Find the adj-face vertex that is neither vi nor vj — it sits on the
+        // interior side of the chord.
+        int k_other = -1;
+        for (int k = 0; k < 3; ++k) {
+            const int v = F(adj_face, k);
+            if (v != vi && v != vj) { k_other = k; break; }
+        }
+        if (k_other >= 0) {
+            Eigen::Vector2d perp(-chord[1] / chord_len, chord[0] / chord_len);
+            const Eigen::Vector2d w_adj = V.row(F(adj_face, k_other));
+            // Flip so perp points AWAY from the interior (= outward).
+            if (perp.dot(w_adj - mid) > 0) perp = -perp;
+            outward = perp;
         }
     }
 
-    Eigen::Vector2d best_p = p;
-    int best_ever = coverage_count(p);
+    std::vector<Eigen::Vector2d> candidates = {mid, vi_pos, vj_pos};
+    if (outward.squaredNorm() > 0.5 && chord_len > 1e-12) {
+        for (double f : {0.1, 0.3, 1.0, 3.0})
+            candidates.push_back(mid + outward * (chord_len * f));
+    }
+
+    // ── OR-POCS from each candidate; keep the best result ─────────────────
     const int n_fbvs = (int)seen_fbvs.size();
+    Eigen::Vector2d best_p = mid;
+    int best_ever = -1;
 
-    // OR-POCS: for each uncovered fbv, project onto the halfplanes of the
-    // post-collapse face that currently gives the highest face_slack.
-    // Face assignment is recomputed dynamically every iteration.
-    for (int iter = 0; iter < 2000 && best_ever < n_fbvs; ++iter) {
+    auto run_or_pocs = [&](Eigen::Vector2d p) {
+        Eigen::Vector2d cand_best_p = p;
+        int cand_best_ever = coverage_count(p);
+        for (int iter = 0; iter < 2000 && cand_best_ever < n_fbvs; ++iter) {
+            for (int fbv : seen_fbvs) {
+                if (is_covered(p, fbv)) continue;
+                const Eigen::Vector2d q = m_V_fine.row(fbv);
+
+                // Pick the post-face with the best (least negative) slack for q.
+                int    best_fi    = -1;
+                double best_sl    = -1e18;
+                for (int fi = 0; fi < (int)post_faces.size(); ++fi) {
+                    double sl = face_slack(p, q, post_faces[fi]);
+                    if (sl > best_sl) { best_sl = sl; best_fi = fi; }
+                }
+                if (best_fi < 0) continue;
+
+                const PostFace& pf = post_faces[best_fi];
+
+                // Project onto n1: sgn * cross(a-p, q-p) >= 0
+                {
+                    const Eigen::Vector2d n1 = pf.sgn * Eigen::Vector2d(pf.a[1]-q[1], q[0]-pf.a[0]);
+                    const double c1 = pf.sgn * (pf.a[1]*q[0] - pf.a[0]*q[1]);
+                    const double sl = n1.dot(p) - c1;
+                    if (sl < -1e-12) {
+                        const double nn = n1.squaredNorm();
+                        if (nn > 1e-24) p -= (sl / nn) * n1;
+                    }
+                }
+                // Project onto n3: sgn * cross(p-b, q-b) >= 0
+                {
+                    const Eigen::Vector2d n3 = pf.sgn * Eigen::Vector2d(q[1]-pf.b[1], pf.b[0]-q[0]);
+                    const double c3 = pf.sgn * (pf.b[0]*q[1] - pf.b[1]*q[0]);
+                    const double sl = n3.dot(p) - c3;
+                    if (sl < -1e-12) {
+                        const double nn = n3.squaredNorm();
+                        if (nn > 1e-24) p -= (sl / nn) * n3;
+                    }
+                }
+            }
+
+            const int cov = coverage_count(p);
+            if (cov > cand_best_ever) { cand_best_ever = cov; cand_best_p = p; }
+        }
+        if (cand_best_ever > best_ever) {
+            best_ever = cand_best_ever;
+            best_p    = cand_best_p;
+        }
+    };
+
+    for (const auto& p_init : candidates) {
+        run_or_pocs(p_init);
+        if (best_ever >= n_fbvs) break;   // fully covered; no need to try more
+    }
+
+    // Non-convergence diagnostic: report whenever OR-POCS terminates with at
+    // least one uncovered fbv.  These are the cases where the returned cpos
+    // can leave fine boundary verts outside the post-collapse 1-ring.
+    if (best_ever < (int)seen_fbvs.size()) {
+        std::cout << "[enclosure_pos] non-converged: edge (" << vi << "," << vj
+                  << ")  covered " << best_ever << "/" << seen_fbvs.size()
+                  << " fbvs  best_p=(" << best_p[0] << "," << best_p[1] << ")\n";
+        std::cout << "  uncovered fbvs:";
         for (int fbv : seen_fbvs) {
-            if (is_covered(p, fbv)) continue;
-            const Eigen::Vector2d q = m_V_fine.row(fbv);
-
-            // Pick the post-face with the best (least negative) slack for q.
-            int    best_fi    = -1;
-            double best_sl    = -1e18;
-            for (int fi = 0; fi < (int)post_faces.size(); ++fi) {
-                double sl = face_slack(p, q, post_faces[fi]);
-                if (sl > best_sl) { best_sl = sl; best_fi = fi; }
-            }
-            if (best_fi < 0) continue;
-
-            const PostFace& pf = post_faces[best_fi];
-
-            // Project onto n1: sgn * cross(a-p, q-p) >= 0
-            {
-                const Eigen::Vector2d n1 = pf.sgn * Eigen::Vector2d(pf.a[1]-q[1], q[0]-pf.a[0]);
-                const double c1 = pf.sgn * (pf.a[1]*q[0] - pf.a[0]*q[1]);
-                const double sl = n1.dot(p) - c1;
-                if (sl < -1e-12) {
-                    const double nn = n1.squaredNorm();
-                    if (nn > 1e-24) p -= (sl / nn) * n1;
-                }
-            }
-            // Project onto n3: sgn * cross(p-b, q-b) >= 0
-            {
-                const Eigen::Vector2d n3 = pf.sgn * Eigen::Vector2d(q[1]-pf.b[1], pf.b[0]-q[0]);
-                const double c3 = pf.sgn * (pf.b[0]*q[1] - pf.b[1]*q[0]);
-                const double sl = n3.dot(p) - c3;
-                if (sl < -1e-12) {
-                    const double nn = n3.squaredNorm();
-                    if (nn > 1e-24) p -= (sl / nn) * n3;
-                }
+            if (!is_covered(best_p, fbv)) {
+                const Eigen::Vector2d q = m_V_fine.row(fbv);
+                std::cout << " " << fbv << "(" << q[0] << "," << q[1] << ")";
             }
         }
-
-        const int cov = coverage_count(p);
-        if (cov > best_ever) { best_ever = cov; best_p = p; }
+        std::cout << "\n";
     }
 
     return best_p;

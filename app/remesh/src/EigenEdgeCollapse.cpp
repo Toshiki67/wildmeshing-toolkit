@@ -7,6 +7,11 @@
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
 
+// Sparse symmetric eigensolver (Spectra is header-only on top of Eigen).
+// Spectra 0.6.2 ships its headers at the include root, not under a Spectra/
+// subdirectory, so the include path is just the bare filename.
+#include <SymEigsSolver.h>
+
 // SuiteSparse CHOLMOD (direct C API for max performance)
 #include <cholmod.h>
 
@@ -30,6 +35,64 @@
 #include <Accelerate/Accelerate.h>
 
 namespace app::remesh {
+
+namespace {
+
+// ── Spectra operators ───────────────────────────────────────────────────
+//
+// Two flavours, selected by USE_GENERALIZED_PENCIL below:
+//
+//   (A)  K_ff φ = λ φ
+//        Spectra runs LARGEST_ALGE on K_ff^{-1}. Eigenvectors are unchanged
+//        between K_ff and K_ff^{-1}, so no post-transform is needed.
+//
+//   (B)  K_ff φ = λ M_ff φ
+//        Change of variables ψ = M^{1/2} φ symmetrises the pencil:
+//           M^{-1/2} K_ff M^{-1/2} ψ = λ ψ.
+//        Spectra runs LARGEST_ALGE on the inverse operator
+//           K̃^{-1} = M^{1/2} K_ff^{-1} M^{1/2},
+//        whose largest eigenvalues are 1/λ for the smallest generalized λ.
+//        After the solve we recover φ = M^{-1/2} ψ.
+//
+// Both operators apply K_ff^{-1} through the already-built LDLT factor
+// (m_K_fine_ff_solver), so no extra factorisation is needed.
+
+struct InvK_Op {
+    using Scalar = double;
+
+    const Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>>* solver = nullptr;
+    int n = 0;
+
+    int rows() const { return n; }
+    int cols() const { return n; }
+
+    void perform_op(const Scalar* x_in, Scalar* y_out) const {
+        Eigen::Map<const Eigen::VectorXd> x(x_in,  n);
+        Eigen::Map<Eigen::VectorXd>       y(y_out, n);
+        y = solver->solve(x);
+    }
+};
+
+struct InvKM_SymOp {
+    using Scalar = double;
+
+    const Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>>* solver = nullptr;
+    Eigen::VectorXd M_sqrt;   // sqrt(M_diag[m_free_fine[k]]), length n
+    int n = 0;
+
+    int rows() const { return n; }
+    int cols() const { return n; }
+
+    void perform_op(const Scalar* x_in, Scalar* y_out) const {
+        Eigen::Map<const Eigen::VectorXd> x(x_in,  n);
+        Eigen::Map<Eigen::VectorXd>       y(y_out, n);
+        Eigen::VectorXd t = M_sqrt.cwiseProduct(x);   // M^{1/2} x
+        t = solver->solve(t);                          // K_ff^{-1} M^{1/2} x
+        y = M_sqrt.cwiseProduct(t);                    // M^{1/2} K_ff^{-1} M^{1/2} x
+    }
+};
+
+} // anonymous namespace
 
 
 EigenEdgeCollapse::EigenEdgeCollapse() {
@@ -384,23 +447,135 @@ void EigenEdgeCollapse::init_from_obj(
         }
     }
 
-    // ── Generalized eigenproblem: K_eff u = λ_s M u ───────────────────────
+    // ── Standard symmetric eigenproblem: K_eff φ = λ φ ────────────────────
     const int k_eig = std::min(p.num_modes, nf);
     std::cout << "Computing " << k_eig << " eigenmodes on "
-              << nf << " free DOFs...\n";
+              << nf << " free DOFs (Spectra / sparse)...\n";
 
-    Eigen::GeneralizedSelfAdjointEigenSolver<Eigen::MatrixXd> eigs(Kff_d, Mff_d);
-    if (eigs.info() != Eigen::Success)
-        throw std::runtime_error("Eigenvalue solve failed");
+    // // ── (legacy) Dense generalized eigensolve, kept for reference ──────
+    // Eigen::GeneralizedSelfAdjointEigenSolver<Eigen::MatrixXd> eigs(Kff_d, Mff_d);
+    // if (eigs.info() != Eigen::Success)
+    //     throw std::runtime_error("Eigenvalue solve failed");
+    // m_evals = eigs.eigenvalues().head(k_eig);
+    // Eigen::MatrixXd evecs_free = eigs.eigenvectors().leftCols(k_eig); // nf × k_eig
 
-    // Take first k_eig modes (smallest eigenvalues)
-    m_evals = eigs.eigenvalues().head(k_eig);
-    Eigen::MatrixXd evecs_free = eigs.eigenvectors().leftCols(k_eig); // nf × k_eig
+    // Sparse path: smallest λ of K_ff are 1/μ_max of the operator (K_ff^{-1} for
+    // the standard problem, M^{1/2} K_ff^{-1} M^{1/2} for the generalized one).
+    // Both are SPD → SymEigsSolver with LARGEST_ALGE.  K_ff^{-1} is applied
+    // through the already-built LDLT factor (m_K_fine_ff_solver) — no extra
+    // factorisation, no dense matrix.
+    //
+    // We always run BOTH:
+    //   • Generalized  (K φ = λ M φ)  → m_evals    / m_evecs    (M-orthonormal)
+    //   • Standard     (K φ = λ φ)    → m_evals_std / m_evecs_std (Euclidean)
+    //
+    // Spectra with LARGEST_ALGE returns descending μ = 1/λ — which is the same
+    // as ascending λ, so no flipping is needed.
 
-    // Expand to all DOFs (zero on fixed DOFs)
+    // ── (1) Generalized: K φ = λ M φ ─────────────────────────────────────
+    Eigen::MatrixXd evecs_free;     // nf × k_eig, used to fill m_evecs below
+    {
+        const auto t_eig_start = std::chrono::high_resolution_clock::now();
+
+        InvKM_SymOp op;
+        op.solver = &m_K_fine_ff_solver;
+        op.n      = nf;
+        op.M_sqrt.resize(nf);
+        for (int k = 0; k < nf; ++k)
+            op.M_sqrt[k] = std::sqrt(m_M_diag[m_free_fine[k]]);
+
+        const int ncv    = std::min(nf, std::max(2 * k_eig + 1, k_eig + 10));
+        const int max_it = 2000;
+        const double tol = 1e-10;
+
+        Spectra::SymEigsSolver<double, Spectra::LARGEST_ALGE, InvKM_SymOp>
+            eigs(&op, k_eig, ncv);
+        eigs.init();
+        const int nconv = eigs.compute(max_it, tol);
+        if (eigs.info() != Spectra::SUCCESSFUL)
+            throw std::runtime_error("Spectra eigenvalue solve failed (generalized)");
+
+        const Eigen::VectorXd evals_inv = eigs.eigenvalues();
+        const Eigen::MatrixXd evecs_raw = eigs.eigenvectors();
+        const int n_have = std::min((int)evals_inv.size(), k_eig);
+
+        Eigen::VectorXd evals_asc(k_eig);
+        evecs_free.setZero(nf, k_eig);
+        for (int i = 0; i < n_have; ++i) {
+            evals_asc[i] = (evals_inv[i] != 0.0)
+                ? 1.0 / evals_inv[i]
+                : std::numeric_limits<double>::infinity();
+            // ψ → φ = M^{-1/2} ψ
+            evecs_free.col(i) = evecs_raw.col(i).cwiseQuotient(op.M_sqrt);
+        }
+        for (int i = n_have; i < k_eig; ++i)
+            evals_asc[i] = std::numeric_limits<double>::infinity();
+
+        m_evals = evals_asc;
+
+        const double t_eig = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - t_eig_start).count();
+        std::cout << "[Spectra/gen] K φ = λ M φ: " << nconv << "/" << k_eig
+                  << " converged in " << t_eig << " s (ncv=" << ncv << ")\n";
+        if (nconv < k_eig)
+            std::cerr << "[Spectra/gen] only " << nconv << "/" << k_eig
+                      << " eigenvalues converged\n";
+    }
+
+    // Expand m_evecs to all DOFs (zero on fixed DOFs).
     m_evecs = Eigen::MatrixXd::Zero(ndof_f, k_eig);
     for (int k = 0; k < nf; ++k)
         m_evecs.row(m_free_fine[k]) = evecs_free.row(k);
+
+    // ── (2) Standard: K φ = λ φ — kept as side-by-side reference ─────────
+    // No eig_tol filtering: smallest k_eig eigenvalues are stored as-is,
+    // in ascending order, with eigenvectors directly from Spectra (no M-rescale).
+    {
+        const auto t_eig_start = std::chrono::high_resolution_clock::now();
+
+        InvK_Op op;
+        op.solver = &m_K_fine_ff_solver;
+        op.n      = nf;
+
+        const int ncv    = std::min(nf, std::max(2 * k_eig + 1, k_eig + 10));
+        const int max_it = 2000;
+        const double tol = 1e-10;
+
+        Spectra::SymEigsSolver<double, Spectra::LARGEST_ALGE, InvK_Op>
+            eigs(&op, k_eig, ncv);
+        eigs.init();
+        const int nconv = eigs.compute(max_it, tol);
+        if (eigs.info() != Spectra::SUCCESSFUL)
+            throw std::runtime_error("Spectra eigenvalue solve failed (standard)");
+
+        const Eigen::VectorXd evals_inv = eigs.eigenvalues();
+        const Eigen::MatrixXd evecs_raw = eigs.eigenvectors();
+        const int n_have = std::min((int)evals_inv.size(), k_eig);
+
+        Eigen::VectorXd evals_asc(k_eig);
+        Eigen::MatrixXd evecs_free_std = Eigen::MatrixXd::Zero(nf, k_eig);
+        for (int i = 0; i < n_have; ++i) {
+            evals_asc[i] = (evals_inv[i] != 0.0)
+                ? 1.0 / evals_inv[i]
+                : std::numeric_limits<double>::infinity();
+            evecs_free_std.col(i) = evecs_raw.col(i);
+        }
+        for (int i = n_have; i < k_eig; ++i)
+            evals_asc[i] = std::numeric_limits<double>::infinity();
+
+        m_evals_std = evals_asc;
+        m_evecs_std = Eigen::MatrixXd::Zero(ndof_f, k_eig);
+        for (int k = 0; k < nf; ++k)
+            m_evecs_std.row(m_free_fine[k]) = evecs_free_std.row(k);
+
+        const double t_eig = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - t_eig_start).count();
+        std::cout << "[Spectra/std] K φ = λ φ: " << nconv << "/" << k_eig
+                  << " converged in " << t_eig << " s (ncv=" << ncv << ")\n";
+        if (nconv < k_eig)
+            std::cerr << "[Spectra/std] only " << nconv << "/" << k_eig
+                      << " eigenvalues converged\n";
+    }
 
     // ── Mode selection ─────────────────────────────────────────────────────
     m_modes.clear();
@@ -928,6 +1103,105 @@ int EigenEdgeCollapse::simplify(int target_vertices)
     }
 
     return collapses;
+}
+
+// ============================================================
+//  Current mesh + per-face material E (for visualisation)
+// ============================================================
+
+void EigenEdgeCollapse::set_intermediate_bundle(
+    const std::string& prefix_base, int base_threshold)
+{
+    m_bundle_prefix_base = prefix_base;
+    m_bundle_base        = std::max(0, base_threshold);
+}
+
+void EigenEdgeCollapse::set_cascade_output(const std::string& prefix)
+{
+    m_cascade_prefix = prefix;
+}
+
+void EigenEdgeCollapse::get_current_mesh_with_E(
+    Eigen::MatrixXd& V,
+    Eigen::MatrixXi& F,
+    Eigen::VectorXd& face_E) const
+{
+    extract_current_mesh(V, F);
+    face_E.resize(F.rows());
+    for (int f = 0; f < (int)F.rows(); ++f)
+        face_E[f] = material_E(V, F.row(f));
+}
+
+void EigenEdgeCollapse::get_current_mesh_with_material(
+    Eigen::MatrixXd& V,
+    Eigen::MatrixXi& F,
+    Eigen::VectorXd& face_E,
+    Eigen::VectorXd& face_nu) const
+{
+    extract_current_mesh(V, F);
+    face_E.resize(F.rows());
+    face_nu.resize(F.rows());
+    for (int f = 0; f < (int)F.rows(); ++f) {
+        face_E[f]  = material_E (V, F.row(f));
+        face_nu[f] = material_nu(V, F.row(f));
+    }
+}
+
+void EigenEdgeCollapse::save_simulation_bundle(
+    const std::string& prefix,
+    const Eigen::MatrixXd& V,
+    const Eigen::MatrixXi& F,
+    const Eigen::VectorXd& face_E,
+    const Eigen::VectorXd& face_nu) const
+{
+    // ── Mesh as OBJ (z = 0) ──────────────────────────────────────────────
+    {
+        Eigen::MatrixXd V3 = Eigen::MatrixXd::Zero(V.rows(), 3);
+        V3.leftCols(2) = V;
+        igl::write_triangle_mesh(prefix + ".obj", V3, F);
+    }
+
+    auto dump_vec = [](const std::string& path, const Eigen::VectorXd& v) {
+        std::ofstream ofs(path);
+        ofs << std::setprecision(17);
+        for (int i = 0; i < v.size(); ++i) ofs << v[i] << "\n";
+    };
+    dump_vec(prefix + "_E.txt",  face_E);
+    dump_vec(prefix + "_nu.txt", face_nu);
+
+    // ── Fixed vertex list (zero-displacement Dirichlet) ──────────────────
+    // Matches the BC logic in init_from_obj: left boundary is held only when
+    // fixed_left=true AND no springs are active.
+    {
+        std::vector<int> fixed_verts =
+            (m_p.spring_k > 0.0) ? std::vector<int>{}
+            : (m_p.fixed_left    ? left_boundary_verts(V) : std::vector<int>{});
+        std::ofstream ofs(prefix + "_fixed.txt");
+        for (int v : fixed_verts) ofs << v << "\n";
+    }
+
+    // ── Spring vertex list (fine-mesh vertex indices) ────────────────────
+    // Springs are anchored on the fine mesh — the coarse-side contribution is
+    // P^T · spring_k · P at simulation time, derivable from spring_k (params)
+    // plus the fine-mesh barycentric prolongation onto the coarse mesh in this
+    // bundle.  So we only need the fine-mesh vertex indices here; no triplets.
+    {
+        std::ofstream ofs(prefix + "_spring.txt");
+        for (int vf : m_spring_fine_verts) ofs << vf << "\n";
+    }
+
+    // ── Scalar problem parameters ────────────────────────────────────────
+    {
+        std::ofstream ofs(prefix + "_params.txt");
+        ofs << std::setprecision(17)
+            << "plane_stress=" << (m_p.plane_stress ? "true" : "false") << "\n"
+            << "rho="          << m_p.rho                                << "\n"
+            << "fixed_left="   << (m_p.fixed_left ? "true" : "false")    << "\n"
+            << "alpha="        << m_p.alpha                              << "\n"
+            << "spring_k="     << m_p.spring_k                           << "\n";
+    }
+
+    std::cout << "Wrote simulation bundle to '" << prefix << "_{obj,E,nu,fixed,spring,params}.txt'\n";
 }
 
 // ============================================================

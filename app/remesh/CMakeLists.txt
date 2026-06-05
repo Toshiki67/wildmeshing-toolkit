@@ -4,6 +4,7 @@ file(GLOB_RECURSE LIB_SOURCES CONFIGURE_DEPENDS
     "src/EigenEdgeCollapseInternal.hpp"
     "src/FemAssembly.cpp"
     "src/CostFunctions.cpp"
+    "src/FactorReuseSimplify.cpp"
     "src/Visualization.cpp"
     "src/VisUtils.cpp"
     "src/VisUtils.hpp"
@@ -55,6 +56,23 @@ target_link_libraries(remesh_lib PUBLIC
 # target_link_libraries(remesh_lib PUBLIC ${SuiteSparse_LIBRARIES})
 
 find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+
+# Spectra (header-only sparse eigensolver on top of Eigen).
+# Downloaded via CPM here so init_from_obj can use Spectra::SymEigsSolver instead
+# of Eigen's dense GeneralizedSelfAdjointEigenSolver.
+if(NOT TARGET Spectra::Spectra)
+    include(CPM)
+    CPMAddPackage(
+        NAME spectra
+        GITHUB_REPOSITORY yixuan/spectra
+        GIT_TAG v0.6.2
+        DOWNLOAD_ONLY ON
+    )
+    add_library(Spectra INTERFACE)
+    add_library(Spectra::Spectra ALIAS Spectra)
+    target_include_directories(Spectra SYSTEM INTERFACE ${spectra_SOURCE_DIR}/include)
+endif()
+target_link_libraries(remesh_lib PUBLIC Spectra::Spectra)
 
 
 

@@ -94,6 +94,18 @@ public:
     // Returns number of collapses performed.
     int simplify(int target_vertices);
 
+    // Greedy edge collapse with fine-factorization reuse.
+    //   * L_f = chol(K_f) (already computed in init_from_obj) is reused for every
+    //     per-edge cost evaluation.
+    //   * Cumulative scalar restriction R_s (n_curr × n_fine) and prolongation
+    //     P_s (n_fine × n_curr) are maintained through the collapse history.
+    //     Per collapse only one row of R_s and one column of P_s are touched.
+    //   * Edges live in a priority queue keyed by cost; after each collapse only
+    //     the closed 1-ring of edges around the merged vertex is re-scored.
+    //   * Per-edge cost: 4 fine backsubstitutions + two 4×4 matrix builds + trace.
+    // Implementation lives in FactorReuseSimplify.cpp.
+    int simplify_factor_reuse(int target_vertices);
+
     // ----------------------------------------------------------------- output
 
     void write_obj(const std::string& path) const;
@@ -136,6 +148,74 @@ public:
     // Expose fine mesh for external inspection
     const Eigen::MatrixXd& V_fine() const { return m_V_fine; }
     const Eigen::MatrixXi& F_fine() const { return m_F_fine; }
+    const Eigen::VectorXd& fine_E()  const { return m_fine_E;  }
+    const Eigen::VectorXd& fine_nu() const { return m_fine_nu; }
+
+    // Extract the current (simplified) mesh as dense V, F plus the per-face
+    // Young's modulus (area-weighted average projected from the fine mesh).
+    // Convenience wrapper around extract_current_mesh() + material_E() so
+    // visualisation code (Polyscope, etc.) does not need to reach into the
+    // private API.
+    void get_current_mesh_with_E(
+        Eigen::MatrixXd& V,
+        Eigen::MatrixXi& F,
+        Eigen::VectorXd& face_E) const;
+
+    // Same as above but also returns the per-face Poisson's ratio.  Needed by
+    // downstream simulation (assembly of the elasticity D matrix).
+    void get_current_mesh_with_material(
+        Eigen::MatrixXd& V,
+        Eigen::MatrixXi& F,
+        Eigen::VectorXd& face_E,
+        Eigen::VectorXd& face_nu) const;
+
+    // Dump a self-contained "simulation bundle" describing one mesh and its
+    // FEM problem instance.  Generates the following files under `prefix`:
+    //   <prefix>.obj         — mesh as a 2D OBJ (z = 0)
+    //   <prefix>_E.txt       — per-face Young's modulus, one value per line
+    //   <prefix>_nu.txt      — per-face Poisson's ratio, one value per line
+    //   <prefix>_fixed.txt   — list of vertex indices whose (x, y) DOFs are
+    //                          held to zero by the boundary condition
+    //                          (left-boundary fixed when fixed_left=true and
+    //                           no springs are present; empty otherwise)
+    //   <prefix>_spring.txt  — fine-mesh vertex indices where springs are
+    //                          attached, one per line (same list regardless of
+    //                          which mesh this bundle describes).  Stiffness is
+    //                          in <prefix>_params.txt as `spring_k`.
+    //   <prefix>_params.txt  — scalar problem parameters: plane_stress, rho,
+    //                          fixed_left, alpha, spring_k
+    // Mesh-agnostic: callers can pass either the fine or the simplified mesh.
+    void save_simulation_bundle(
+        const std::string& prefix,
+        const Eigen::MatrixXd& V,
+        const Eigen::MatrixXi& F,
+        const Eigen::VectorXd& face_E,
+        const Eigen::VectorXd& face_nu) const;
+
+    // Configure intermediate simulation-bundle saves during
+    // simplify_factor_reuse().  Bundles are written along the geometric
+    // sequence  base, 4·base, 16·base, …  (`base` = `base_threshold`), in
+    // decreasing order, every time the live coarse vertex count hits one of
+    // those values and remains strictly above the final target.  Typical use:
+    // base_threshold = 4 · target  → saves at 4·t, 16·t, 64·t, … below n_init.
+    // Pass base_threshold = 0 to disable.
+    void set_intermediate_bundle(const std::string& prefix_base, int base_threshold);
+
+    // Configure cascadic-MG prolongation output for simplify_factor_reuse().
+    // Tracks each C_l vertex's containing face throughout the C_l → C_{l+1}
+    // stage via 1-ring-local point-location.  At stage end the barycentric
+    // weights are read off from the final coarse rest positions.
+    //
+    // Output files per stage (l = 0..L-1 with level 0 = finest):
+    //   <prefix>_level_<L>.obj         — mesh at level L
+    //   <prefix>_P_<l+1>_to_<l>.txt    — triplet "row col val" lines for the
+    //                                    scalar prolongation  P̂_{l+1→l}
+    //                                    (rows index finer compact vertex IDs,
+    //                                     cols index coarser compact vertex IDs).
+    //                                    The vector prolongation P = P̂ ⊗ I_2
+    //                                    is reconstructible from the scalar form.
+    // Empty prefix disables the feature.
+    void set_cascade_output(const std::string& prefix);
 
     // ------------------------------------------- TriMesh callback overrides
 
@@ -148,8 +228,15 @@ private:
     Eigen::MatrixXd m_V_fine;  // n_fine × 2
     Eigen::MatrixXi m_F_fine;  // m_fine × 3
 
-    Eigen::VectorXd m_evals;   // k_eig eigenvalues
+    Eigen::VectorXd m_evals;   // k_eig generalized eigenvalues  (K φ = λ M φ)
     Eigen::MatrixXd m_evecs;   // 2*n_fine × k_eig (extended to all DOFs)
+
+    // Side-by-side standard symmetric eigenpencil (K φ = λ φ) — kept all k_eig
+    // modes in ascending order (no eig_tol filtering). Available for alternative
+    // cost functions that want the K-orthonormal basis instead of the
+    // M-orthonormal one.
+    Eigen::VectorXd m_evals_std;
+    Eigen::MatrixXd m_evecs_std;
     Eigen::VectorXd m_M_diag;  // 2*n_fine lumped mass diagonal
     Eigen::SparseMatrix<double> m_M_fine;
 
@@ -177,6 +264,15 @@ private:
 
     CollapseParams m_p;
     std::string    m_output_dir; // set via set_output_dir(); "" = disabled
+
+    // Intermediate simulation-bundle config; populated by set_intermediate_bundle().
+    // m_bundle_base is the smallest threshold in the geometric sequence
+    // {base, 4·base, 16·base, ...}.  Empty prefix or zero base disables saves.
+    std::string m_bundle_prefix_base;
+    int         m_bundle_base = 0;
+
+    // Cascade-MG prolongation output prefix; empty disables.
+    std::string m_cascade_prefix;
 
     // Fine-mesh vertex IDs to attach springs to (loaded from p.spring_fine_verts_file).
     // Empty → fall back to left/right boundary detection inside apply_spring_bcs.
